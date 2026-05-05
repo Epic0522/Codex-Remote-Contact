@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "updatedAt": null,
+  "qq": {
+    "allowedGroups": [],
+    "ownerUserIds": [],
+    "bannedUserIds": [],
+    "enhancer": {
+      "enabled": false
+    },
+    "proactive": {
+      "enabled": false,
+      "minIntervalMs": 180000
+    }
+  },
+  "imessage": {
+    "trustedHandles": [],
+    "replyHandle": ""
+  },
+  "ai": {
+    "model": "gpt-5.4-mini",
+    "reasoningEffort": "low",
+    "imessageModel": "gpt-5.4",
+    "imessageReasoningEffort": "medium"
+  },
+  "remoteExecution": {
+    "model": "gpt-5.4",
+    "reasoningEffort": "medium",
+    "skill": "none"
+  },
+  "unifiedMemory": {
+    "autoWriteOnSkillRecall": false,
+    "autoWriteOnIMessageRecall": true,
+    "manualHandoffCommand": true
+  },
+  "branding": {
+    "assistantName": "assistant",
+    "ownerLabel": "owner",
+    "assistantMentions": [
+      "@assistant"
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Node / local environment
+node_modules/
+.env
+.env.*
+
+# Build outputs and local downloads
+build/
+downloads/
+backups/
+apps/
+vendor/
+
+# Runtime output
+runtime/
+!runtime/
+!runtime/logs/
+!runtime/replies/
+runtime/logs/*
+runtime/replies/*
+!runtime/logs/.gitkeep
+!runtime/replies/.gitkeep
+
+# Logs and pid files
+*.log
+*.pid
+
+# Local state
+data/keep-awake.pid
+data/previous-brightness.txt
+modules/system-control/bin/
+config/local.codexremotecontact.chat-hub.plist

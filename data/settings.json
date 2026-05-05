@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "updatedAt": null,
+  "qq": {
+    "allowedGroups": [],
+    "ownerUserIds": [],
+    "bannedUserIds": []
+  },
+  "imessage": {
+    "trustedHandles": [],
+    "replyHandle": ""
+  },
+  "remoteExecution": {
+    "model": "gpt-5.4",
+    "reasoningEffort": "medium",
+    "skill": "none"
+  }
+}
