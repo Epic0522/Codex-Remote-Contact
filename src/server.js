@@ -2787,9 +2787,11 @@ async function handleIMessageCommand(event) {
         result = { ok: true, summary: "Remote execution reply generated" };
       } else {
         const unifiedMemoryContext = await prepareUnifiedMemoryForIMessage(event);
-        reply = await buildIMessagePrivateReply(event, unifiedMemoryContext.promptContext);
         event.unifiedMemoryDecision = unifiedMemoryContext.decision;
         event.unifiedMemoryRecallRoute = unifiedMemoryContext.recallRoute;
+        reply = await buildIMessagePrivateReply(event, unifiedMemoryContext.promptContext, {
+          suppressRollingIMessageContext: unifiedMemoryContext.recallRoute?.source?.startsWith?.("desktop")
+        });
         result = { ok: true, summary: "Private reply generated" };
       }
       const attachmentPaths = state.remoteExecution.enabled ? extractIMessageAttachmentMarkers(reply) : [];
@@ -4028,10 +4030,10 @@ async function loadRemoteExecutionSkillContext() {
   }
 }
 
-async function buildIMessagePrivateReply(event, unifiedMemoryContext = "") {
+async function buildIMessagePrivateReply(event, unifiedMemoryContext = "", options = {}) {
   const id = crypto.randomUUID();
   const outputPath = join(codexTmpDir, `${id}.imessage.txt`);
-  const memoryContext = formatIMessageMemoryContext(event.handle);
+  const memoryContext = options.suppressRollingIMessageContext ? "" : formatIMessageMemoryContext(event.handle);
   const prompt = [
     await buildIMessageInstructions(),
     "",
@@ -4168,7 +4170,10 @@ async function buildRecentCodexContextForIMessage(event, query, unifiedPrompt, r
 
 async function judgeUnifiedMemoryRecallRouteForIMessage(event, decision) {
   const text = String(event.text || "").trim();
-  const ruleRoute = routeUnifiedMemoryRecallByRules(text, decision, event);
+  let ruleRoute = routeUnifiedMemoryRecallByRules(text, decision, event);
+  if (ruleRoute.reason === "generic_recent_work") {
+    ruleRoute = await chooseGenericRecentRecallRoute(event, ruleRoute);
+  }
   if (ruleRoute.source === "desktop_recent" && ruleRoute.confidence >= 0.82) return ruleRoute;
   if (!shouldRunRecallRouteModel(text, ruleRoute, decision)) return ruleRoute;
   try {
@@ -4181,6 +4186,43 @@ async function judgeUnifiedMemoryRecallRouteForIMessage(event, decision) {
   }
 }
 
+async function chooseGenericRecentRecallRoute(event, fallbackRoute) {
+  const mobile = getLatestIMessageTurnMeta(event?.handle);
+  let desktop = null;
+  try {
+    const snippets = await searchRecentCodexContext({
+      query: event?.text || fallbackRoute.query,
+      mode: "latest",
+      limit: 1,
+      maxFiles: 12
+    });
+    desktop = snippets[0] || null;
+  } catch {
+    desktop = null;
+  }
+
+  const mobileTime = Date.parse(mobile?.at || "");
+  const desktopTime = Date.parse(desktop?.timestamp || "");
+  if (Number.isFinite(mobileTime) && (!Number.isFinite(desktopTime) || mobileTime > desktopTime)) {
+    return {
+      needsRecall: true,
+      source: "mobile_context",
+      query: event?.text || fallbackRoute.query,
+      confidence: 0.86,
+      reason: "generic_recent_work_mobile_newer",
+      comparedAt: { mobile: mobile?.at, desktop: desktop?.timestamp || null }
+    };
+  }
+
+  return {
+    ...fallbackRoute,
+    source: "desktop_recent",
+    confidence: Math.max(fallbackRoute.confidence || 0, 0.86),
+    reason: "generic_recent_work_desktop_newer",
+    comparedAt: { mobile: mobile?.at || null, desktop: desktop?.timestamp || null }
+  };
+}
+
 function routeUnifiedMemoryRecallByRules(text, decision = {}, event = null) {
   const normalized = String(text || "").replace(/\s+/g, "").toLowerCase();
   const previousUserText = getPreviousIMessageUserText(event?.handle);
@@ -4190,6 +4232,8 @@ function routeUnifiedMemoryRecallByRules(text, decision = {}, event = null) {
   const hasConcreteClientTopic = /(client|webui|通讯中枢|客户端|bundle|resources?|资源|启动器|localhost:3789)/i.test(normalized);
   const hasDesktop = /(电脑上|电脑这边|桌面上|cli|codex|本机|这边)/i.test(normalized);
   const hasRecent = /(刚刚|刚才|刚才那会|刚那会|刚在|刚问|刚说|刚发|刚做|刚弄|刚改|刚更新|刚修)/i.test(normalized);
+  const hasGenericWorkRecall = /(做了什么|做过什么|干了什么|弄了什么|搞了什么|改了什么|更新了什么|处理了什么|修了什么|做到哪|做完没|弄好没|搞好没)/i.test(normalized);
+  const hasMobileAnchor = /(手机上|手机端|imessage|短信里|消息里|这条消息|刚才这句|刚刚这句)/i.test(normalized);
   const hasPastTopic = /(前两天|昨天|上次|之前|做到哪|整理到哪|进度|还记得|记不记得|接着|继续)/i.test(normalized);
   if (asksAboutPreviousQuestion && previousLooksDesktopRecall) {
     return {
@@ -4218,6 +4262,15 @@ function routeUnifiedMemoryRecallByRules(text, decision = {}, event = null) {
       reason: "recent_desktop"
     };
   }
+  if (hasRecent && hasGenericWorkRecall && !hasMobileAnchor) {
+    return {
+      needsRecall: true,
+      source: "desktop_recent",
+      query: text,
+      confidence: 0.84,
+      reason: "generic_recent_work"
+    };
+  }
   if (hasDesktop || hasPastTopic || ["read", "both"].includes(decision.action)) {
     return {
       needsRecall: true,
@@ -4240,6 +4293,22 @@ function getPreviousIMessageUserText(handle) {
     }
   }
   return "";
+}
+
+function getLatestIMessageTurnMeta(handle) {
+  const key = getIMessageMemoryKey(handle);
+  const entries = Array.isArray(state.imessage.memory.entries[key]) ? state.imessage.memory.entries[key] : [];
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (String(entry?.text || "").trim() && entry?.at) {
+      return {
+        role: entry.role,
+        text: String(entry.text || "").trim(),
+        at: entry.at
+      };
+    }
+  }
+  return null;
 }
 
 function shouldRunRecallRouteModel(text, ruleRoute, decision = {}) {
