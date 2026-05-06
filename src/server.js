@@ -2851,7 +2851,7 @@ async function handleIMessageCommand(event) {
 }
 
 function getIMessageReplyHandle(event) {
-  return state.imessage.replyHandle || event.handle;
+  return event?.handle || state.imessage.replyHandle;
 }
 
 function isIMessageDesktopScreenshotRequest(text) {
@@ -4033,7 +4033,13 @@ async function loadRemoteExecutionSkillContext() {
 async function buildIMessagePrivateReply(event, unifiedMemoryContext = "", options = {}) {
   const id = crypto.randomUUID();
   const outputPath = join(codexTmpDir, `${id}.imessage.txt`);
-  const memoryContext = options.suppressRollingIMessageContext ? "" : formatIMessageMemoryContext(event.handle);
+  const memoryContext = unifiedMemoryContext
+    ? ""
+    : formatUnifiedFlaskPrompt({
+        entries: collectIMessageFlaskEntries(event.handle),
+        unifiedPrompt: "",
+        recallRoute: options.recallRoute
+      });
   const prompt = [
     await buildIMessageInstructions(),
     "",
@@ -4086,19 +4092,55 @@ function getIMessageMemoryKey(handle) {
   return String(handle || "default").trim() || "default";
 }
 
-function formatIMessageMemoryContext(handle) {
+function collectIMessageFlaskEntries(handle) {
   const key = getIMessageMemoryKey(handle);
   const entries = Array.isArray(state.imessage.memory.entries[key]) ? state.imessage.memory.entries[key] : [];
-  if (!entries.length) return "";
-  const lines = entries.slice(-state.imessage.memory.perHandleLimit).map((entry) => {
+  return entries
+    .map((entry) => ({
+      source: "conversation",
+      role: entry.role,
+      text: String(entry.text || "").replace(/\s+/g, " ").trim(),
+      at: entry.at,
+      timestamp: entry.at
+    }))
+    .filter((entry) => entry.text);
+}
+
+function formatIMessageMemoryContext(handle, options = {}) {
+  const normalized = collectIMessageFlaskEntries(handle);
+  if (!normalized.length) return "";
+
+  const base = normalized.slice(-6);
+  const body = normalized.slice(-18, -6);
+  const neck = normalized.slice(0, -18);
+  const formatLine = (entry) => {
     const speaker = entry.role === "assistant" ? assistantName : ownerLabel;
-    return `${speaker}：${String(entry.text || "").trim()}`;
-  }).filter((line) => !/：$/.test(line));
-  if (!lines.length) return "";
+    const time = entry.at ? ` @${entry.at}` : "";
+    return `${speaker}${time}：${entry.text.slice(0, 420)}`;
+  };
+  const bodyLines = compactIMessageFlaskEntries(body, 8, 180, formatLine);
+  const neckLines = compactIMessageFlaskEntries(neck, 6, 120, formatLine);
+  const priorityNote = options.desktopContextActive
+    ? "当前存在更新的连续上下文；旧对话只用于语气、人物关系和背景。如果与更新片段冲突，以更新片段为准。"
+    : "时效性优先：base 比 body 重要，body 比 neck 重要；旧内容只作背景，不要覆盖最新消息。";
   return [
-    `以下是你和${ownerLabel}的 iMessage 长期滚动上下文，请自然参考，不要逐字复述：`,
-    ...lines
-  ].join("\n");
+    `以下是你和${ownerLabel}的统一锥形瓶上下文，请自然参考，不要逐字复述：`,
+    priorityNote,
+    "base / 最新手机侧原文：",
+    ...base.map(formatLine),
+    bodyLines.length ? "body / 较早手机侧摘要：" : "",
+    ...bodyLines,
+    neckLines.length ? "neck / 更早手机侧线索：" : "",
+    ...neckLines
+  ].filter(Boolean).join("\n");
+}
+
+function compactIMessageFlaskEntries(entries, limit, maxLength, formatLine) {
+  if (!Array.isArray(entries) || !entries.length) return [];
+  return entries
+    .slice(-limit)
+    .map((entry) => formatLine(entry).slice(0, maxLength))
+    .filter(Boolean);
 }
 
 async function rememberIMessageTurn(event, reply) {
@@ -4123,29 +4165,157 @@ async function rememberIMessageTurn(event, reply) {
 
 async function prepareUnifiedMemoryForIMessage(event) {
   const decision = await judgeUnifiedMemoryForIMessage(event);
-  const recallRoute = await judgeUnifiedMemoryRecallRouteForIMessage(event, decision);
+  let recallRoute = await judgeUnifiedMemoryRecallRouteForIMessage(event, decision);
   if (!["read", "both"].includes(decision.action) && !recallRoute.needsRecall) {
-    return { decision, promptContext: "" };
+    recallRoute = await chooseFreshCrossDeviceRecallRoute(event, recallRoute);
   }
   const query = recallRoute.query || decision.query || decision.topic || event.text;
   const unifiedPrompt = await unifiedMemory.formatForPrompt({
     query,
     limit: 8
   });
-  const recentPrompt = await buildRecentCodexContextForIMessage(event, query, unifiedPrompt, recallRoute);
-  const promptContext = recentPrompt
-    ? [
-        recentPrompt,
-        unifiedPrompt
-          ? `以下长期统一记忆可能较旧；如果和最近桌面对话冲突，请优先相信上面的最近桌面对话片段：\n${unifiedPrompt}`
-          : ""
-      ].filter(Boolean).join("\n\n")
-    : [unifiedPrompt, recentPrompt].filter(Boolean).join("\n\n");
+  const entries = [
+    ...collectIMessageFlaskEntries(event.handle),
+    ...await collectDesktopFlaskEntriesForIMessage(event, query, recallRoute)
+  ];
+  const promptContext = formatUnifiedFlaskPrompt({
+    entries,
+    unifiedPrompt,
+    recallRoute
+  });
   return {
     decision: recallRoute.needsRecall && decision.action === "none" ? { ...decision, action: "read", query } : decision,
     recallRoute,
     promptContext
   };
+}
+
+async function collectDesktopFlaskEntriesForIMessage(event, query, recallRoute = {}) {
+  try {
+    const latest = await searchRecentCodexContext({
+      query: query || event.text,
+      mode: recallRoute.source === "desktop_topic" ? "topic" : "latest",
+      limit: 18,
+      maxFiles: 24
+    });
+    let snippets = latest;
+    const needsTopicBackfill = shouldBackfillTopicByStructure(event?.text, latest);
+    if (needsTopicBackfill) {
+      const topicQuery = inferDesktopTopicQuery(latest) || query || event.text;
+      const topic = await searchRecentCodexContext({
+        query: topicQuery,
+        mode: "topic",
+        limit: 18,
+        maxFiles: 24
+      });
+      const completed = topic.filter((snippet) => isCompletedSnippet(snippet));
+      snippets = completed.length ? [...latest, ...completed, ...topic] : latest;
+    }
+    return dedupeFlaskEntries(snippets.map((snippet) => ({
+      source: "conversation",
+      role: snippet.role,
+      phase: snippet.phase,
+      completed: snippet.completed,
+      pinned: needsTopicBackfill && isCompletedSnippet(snippet),
+      text: String(snippet.text || "").replace(/\s+/g, " ").trim(),
+      at: snippet.timestamp,
+      timestamp: snippet.timestamp,
+      score: snippet.score
+    })).filter((entry) => entry.text));
+  } catch {
+    return [];
+  }
+}
+
+function shouldBackfillTopicByStructure(text, snippets = []) {
+  const signal = textInformationSignal(text);
+  if (signal.concreteAnchors >= 2) return false;
+  if (signal.units <= 6) return true;
+  const latestHasOnlyNonCompletedAssistant = snippets.some((snippet) => snippet.role === "assistant")
+    && !snippets.some((snippet) => isCompletedSnippet(snippet));
+  return signal.units <= 12 && latestHasOnlyNonCompletedAssistant;
+}
+
+function inferDesktopTopicQuery(snippets = []) {
+  const answer = [...snippets].reverse().find((snippet) => isCompletedSnippet(snippet));
+  if (answer?.text) return answer.text.slice(0, 180);
+  const user = [...snippets].reverse().find((snippet) => (
+    snippet.role === "user"
+    && !isLowValueTopicText(snippet.text)
+    && textInformationSignal(snippet.text).units > 6
+  ));
+  return user?.text?.slice(0, 120) || "";
+}
+
+function isCompletedSnippet(snippet) {
+  return snippet?.completed === true || ["final_answer", "task_complete"].includes(String(snippet?.phase || ""));
+}
+
+function textInformationSignal(text) {
+  const raw = String(text || "").trim();
+  const cjkRuns = raw.match(/[\u4e00-\u9fff]{2,}/g) || [];
+  const asciiRuns = raw.match(/[a-z0-9_.-]{3,}/gi) || [];
+  const concreteAnchors = asciiRuns.length + cjkRuns.filter((run) => run.length >= 3).length;
+  return {
+    units: [...raw.matchAll(/[\u4e00-\u9fff]|[a-z0-9_.-]+/gi)].length,
+    concreteAnchors
+  };
+}
+
+function isLowValueTopicText(text) {
+  return /(# Files mentioned by the user|\/(?:Users|home|var|tmp)\/|Library\/Containers|Data\/Library|\.png|\.jpe?g|截图|image)/i.test(String(text || ""));
+}
+
+function formatUnifiedFlaskPrompt({ entries = [], unifiedPrompt = "", recallRoute = null } = {}) {
+  const normalized = entries
+    .filter((entry) => entry?.text)
+    .sort((a, b) => Date.parse(a.timestamp || a.at || "") - Date.parse(b.timestamp || b.at || ""));
+  const deduped = dedupeFlaskEntries(normalized);
+  const pinned = deduped.filter((entry) => entry.pinned).slice(-4);
+  const base = dedupeFlaskEntries([...deduped.slice(-8), ...pinned])
+    .sort((a, b) => Date.parse(a.timestamp || a.at || "") - Date.parse(b.timestamp || b.at || ""));
+  const baseKeys = new Set(base.map((entry) => `${entry.role}:${entry.text}`));
+  const rest = deduped.filter((entry) => !baseKeys.has(`${entry.role}:${entry.text}`));
+  const body = rest.slice(-16);
+  const neck = rest.slice(0, -16);
+  const line = (entry, maxLength) => {
+    const speaker = entry.role === "assistant"
+      ? assistantName
+      : entry.role === "tool"
+        ? "执行结果"
+        : entry.role === "event"
+          ? "事件"
+          : ownerLabel;
+    const time = entry.timestamp || entry.at ? ` @${entry.timestamp || entry.at}` : "";
+    const marker = entry.completed ? " [完成态]" : "";
+    return `${speaker}${time}${marker}：${entry.text.slice(0, maxLength)}`;
+  };
+  const parts = [
+    "以下是统一记忆锥形瓶。所有来源已融合为一条连续上下文，不要按设备割裂理解。",
+    "时效性第一：base 是最新事实；body 是较早摘要；neck 和长期记忆只作背景。所有事件都会先进入溶液，再按时间和信息密度压缩。若内容冲突，以更新、更贴近当前问题的 base 为准。只有带明确时间点的完成态片段才能当作已完成结果；没看到完成态就说还没看到结果，不要脑补。",
+    recallRoute?.reason ? `当前上下文路由：${recallRoute.reason}` : "",
+    recallRoute?.comparedAt ? `新鲜度比较：latestA=${recallRoute.comparedAt.mobile || "none"} latestB=${recallRoute.comparedAt.desktop || "none"}` : "",
+    base.length ? "base / 最新连续上下文：" : "",
+    ...base.map((entry) => line(entry, 520)),
+    body.length ? "body / 较早连续摘要：" : "",
+    ...body.slice(-8).map((entry) => line(entry, 200)),
+    neck.length ? "neck / 更早背景线索：" : "",
+    ...neck.slice(-6).map((entry) => line(entry, 120)),
+    unifiedPrompt ? `长期统一记忆：\n${unifiedPrompt}` : ""
+  ];
+  return parts.filter(Boolean).join("\n");
+}
+
+function dedupeFlaskEntries(entries) {
+  const seen = new Set();
+  const output = [];
+  for (const entry of entries) {
+    const key = `${entry.role}:${entry.text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(entry);
+  }
+  return output;
 }
 
 async function buildRecentCodexContextForIMessage(event, query, unifiedPrompt, recallRoute = {}) {
@@ -4188,18 +4358,7 @@ async function judgeUnifiedMemoryRecallRouteForIMessage(event, decision) {
 
 async function chooseGenericRecentRecallRoute(event, fallbackRoute) {
   const mobile = getLatestIMessageTurnMeta(event?.handle);
-  let desktop = null;
-  try {
-    const snippets = await searchRecentCodexContext({
-      query: event?.text || fallbackRoute.query,
-      mode: "latest",
-      limit: 1,
-      maxFiles: 12
-    });
-    desktop = snippets[0] || null;
-  } catch {
-    desktop = null;
-  }
+  const desktop = await getLatestDesktopContextSnippet(event?.text || fallbackRoute.query);
 
   const mobileTime = Date.parse(mobile?.at || "");
   const desktopTime = Date.parse(desktop?.timestamp || "");
@@ -4221,6 +4380,49 @@ async function chooseGenericRecentRecallRoute(event, fallbackRoute) {
     reason: "generic_recent_work_desktop_newer",
     comparedAt: { mobile: mobile?.at || null, desktop: desktop?.timestamp || null }
   };
+}
+
+async function chooseFreshCrossDeviceRecallRoute(event, fallbackRoute = {}) {
+  const mobile = getLatestIMessageTurnMeta(event?.handle);
+  const desktop = await getLatestDesktopContextSnippet(event?.text || fallbackRoute.query);
+  const mobileTime = Date.parse(mobile?.at || "");
+  const desktopTime = Date.parse(desktop?.timestamp || "");
+  const freshWindowMs = 15 * 60 * 1000;
+  const desktopIsFresh = Number.isFinite(desktopTime) && Date.now() - desktopTime <= freshWindowMs;
+  const desktopBeatsMobile = desktopIsFresh && (!Number.isFinite(mobileTime) || desktopTime > mobileTime);
+  if (!desktopBeatsMobile) {
+    return {
+      ...fallbackRoute,
+      needsRecall: false,
+      source: fallbackRoute.source || "none",
+      query: fallbackRoute.query || "",
+      confidence: fallbackRoute.confidence || 0.35,
+      reason: fallbackRoute.reason || "no_fresh_cross_device_context",
+      comparedAt: { mobile: mobile?.at || null, desktop: desktop?.timestamp || null }
+    };
+  }
+  return {
+    needsRecall: true,
+    source: "desktop_recent",
+    query: event?.text || fallbackRoute.query || "",
+    confidence: 0.72,
+    reason: "fresh_desktop_without_keyword",
+    comparedAt: { mobile: mobile?.at || null, desktop: desktop?.timestamp || null }
+  };
+}
+
+async function getLatestDesktopContextSnippet(query) {
+  try {
+    const snippets = await searchRecentCodexContext({
+      query,
+      mode: "latest",
+      limit: 1,
+      maxFiles: 12
+    });
+    return snippets[0] || null;
+  } catch {
+    return null;
+  }
 }
 
 function routeUnifiedMemoryRecallByRules(text, decision = {}, event = null) {
