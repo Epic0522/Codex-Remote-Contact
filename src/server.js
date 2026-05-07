@@ -1628,7 +1628,7 @@ async function buildModelReply(event) {
   const repetitionGuard = state.qq.enhancer.enabled ? buildQqRepetitionGuard(event) : "";
   const webContext = await buildWebLookupContext(event);
   const stickerCatalog = state.qq.enhancer.enabled ? await buildQqStickerCatalog(qqStickerDir) : [];
-  const qqModelImages = state.qq.enhancer.enabled ? getQqModelImageInputs(event, text) : [];
+  const qqModelImages = getQqModelImageInputs(event, text);
   const shouldInspectImages = qqModelImages.length > 0;
   const imagePaths = shouldInspectImages
     ? await prepareQqModelImages(qqModelImages, {
@@ -1650,13 +1650,13 @@ async function buildModelReply(event) {
     webContext ? "" : null,
     state.qq.enhancer.enabled && event.proactiveDecision?.ownerContext ? `触发原因：${ownerLabel}刚刚在群里说话，Hub 已扫描上文并发现有你感兴趣的内容。请像看到上文后主动探头一样回应，不要假装${ownerLabel}直接问了你。` : null,
     state.qq.enhancer.enabled && event.proactiveDecision?.ownerContext ? "" : null,
-    state.qq.enhancer.enabled && event.pendingImageRequestText ? `触发原因：${ownerLabel}刚刚说“${event.pendingImageRequestText}”，随后这张 QQ 图片到达。请直接看这张图并回应。` : null,
-    state.qq.enhancer.enabled && event.pendingImageRequestText ? "" : null,
-    state.qq.enhancer.enabled && hasAnyQqImageReference(event) && !shouldInspectImages ? "本条 QQ 消息或引用消息带了图片，但文本兴趣不足或未明确要求看图；Hub 已跳过视觉输入以节省 token。不要声称看过图片内容。" : null,
-    state.qq.enhancer.enabled && shouldInspectImages ? `收到的 QQ 图片：${formatQqImageSummary(qqModelImages)}` : null,
-    state.qq.enhancer.enabled && imagePaths.length ? `可查看的本地图片数量：${imagePaths.length}` : null,
-    state.qq.enhancer.enabled && imagePaths.length ? "请结合图片内容回复。不要过度保守：只要能看清主元素、文字、构图或梗图大意，就先说你看到了什么并给出判断；只有完全无法辨认主体时才说看不清。" : null,
-    state.qq.enhancer.enabled && hasAnyQqImageReference(event) ? "" : null,
+    event.pendingImageRequestText ? `触发原因：${ownerLabel}刚刚说“${event.pendingImageRequestText}”，随后这张 QQ 图片到达。请直接看这张图并回应。` : null,
+    event.pendingImageRequestText ? "" : null,
+    hasAnyQqImageReference(event) && !shouldInspectImages ? "本条 QQ 消息或引用消息带了图片，但文本兴趣不足或未明确要求看图；Hub 已跳过视觉输入以节省 token。不要声称看过图片内容。" : null,
+    shouldInspectImages ? `收到的 QQ 图片：${formatQqImageSummary(qqModelImages)}` : null,
+    imagePaths.length ? `可查看的本地图片数量：${imagePaths.length}` : null,
+    imagePaths.length ? "请结合图片内容回复。不要过度保守：只要能看清主元素、文字、构图或梗图大意，就先说你看到了什么并给出判断；只有完全无法辨认主体时才说看不清。" : null,
+    hasAnyQqImageReference(event) ? "" : null,
     state.qq.enhancer.enabled ? "本地表情包库：" : null,
     state.qq.enhancer.enabled ? formatQqStickerCatalog(stickerCatalog) : null,
     state.qq.enhancer.enabled && stickerCatalog.length ? "表情包库可用时，部署者可以在自定义 profile 或 QQ enhancer 包中说明何时使用 [[qq_sticker:表情包名]]；只能选择提示里真实存在的表情包名。" : null,
@@ -2003,7 +2003,6 @@ function shouldUseWebLookup(text) {
 }
 
 function noteQqImageRequest(event) {
-  if (!state.qq.enhancer.enabled) return;
   if (!event.groupId || event.type === "private_message") return;
   const text = stripMentionText(event.text);
   if (!isQqImageLookRequest(text)) return;
@@ -2017,7 +2016,6 @@ function noteQqImageRequest(event) {
 }
 
 function hasPendingQqImageRequest(event) {
-  if (!state.qq.enhancer.enabled) return false;
   if (!event.groupId || !Array.isArray(event.images) || event.images.length === 0) return false;
   const pending = state.qq.proactive.pendingImageRequests[event.groupId];
   if (!pending) return false;
@@ -2033,9 +2031,9 @@ function hasPendingQqImageRequest(event) {
 }
 
 function shouldInspectQqImages(event, text) {
-  if (!state.qq.enhancer.enabled) return false;
   if (!hasAnyQqImageReference(event)) return false;
   if (event.proactiveDecision?.inspectImages || event.pendingImageRequestText) return true;
+  if (Array.isArray(event.replyContext?.images) && event.replyContext.images.length > 0) return true;
   const normalized = String(text || "").trim();
   if (!normalized) return false;
   if (isQqImageLookRequest(normalized)) {
@@ -2049,8 +2047,7 @@ function getQqModelImageInputs(event, text) {
   const currentImages = Array.isArray(event.images) ? event.images : [];
   const quotedImages = Array.isArray(event.replyContext?.images) ? event.replyContext.images : [];
   if (currentImages.length > 0) return currentImages;
-  if (quotedImages.length > 0 && isQqImageLookRequest(text)) return quotedImages;
-  if (quotedImages.length > 0 && scoreQqTextInterest(String(text || ""), event) >= 6) return quotedImages;
+  if (quotedImages.length > 0) return quotedImages;
   return [];
 }
 
@@ -2060,7 +2057,7 @@ function hasAnyQqImageReference(event) {
 }
 
 function isQqImageLookRequest(text) {
-  return /(看图|看一下图|看看图|这图|这个图|这张|图片|截图|图里|图上|什么图|配图|P图|p图|识别|看得懂|看不懂)/i.test(String(text || ""));
+  return /(看图|看一下图|看看图|这图|这个图|这张|图片|截图|表情包|图里|图上|什么图|配图|识别|看得懂|看不懂|何意味|逆天|抽象|离谱|绷不住|典中典|味太冲|评价一下|锐评|说说|怎么看|看法)/i.test(String(text || ""));
 }
 
 async function searchWeb(query) {
@@ -3772,8 +3769,8 @@ async function activateCodexDesktopApp() {
     ok: true,
     summary: "Codex desktop activated",
     reply: quota
-      ? `Codex 已切到前台啦。\n\n${formatCodexQuotaDetail("实时额度：", quota)}`
-      : "Codex 已切到前台啦。"
+      ? `Codex 已切到前台。\n\n${formatCodexQuotaDetail("实时额度：", quota)}`
+      : "Codex 已切到前台。"
   };
 }
 
@@ -3795,7 +3792,7 @@ async function startCodexDesktopApp() {
       ? quota
         ? `Codex 已启动。\n\n${formatCodexQuotaDetail("实时额度：", quota)}`
         : "Codex 已启动。"
-      : "Codex 启动命令已经发出，不过我还没等到它完全起来。你可以稍等一会儿再发 /刷新额度。"
+      : "Codex 启动命令已经发出，你可以稍等一会儿再发 /刷新额度。"
   };
 }
 
@@ -5093,21 +5090,86 @@ async function fetchOneBotMessage(messageId, selfId) {
   const data = body.data;
   const senderId = data.user_id == null ? undefined : String(data.user_id);
   const segments = Array.isArray(data.message) ? data.message : [];
+  const forwardSegment = segments.find((segment) => segment?.type === "forward");
   const textFromSegments = segments
     .filter((segment) => segment?.type === "text")
     .map((segment) => segment.data?.text ?? "")
     .join("")
     .trim();
-  const images = extractOneBotImageInputs(data);
+  const forwardContext = forwardSegment?.data?.id
+    ? await fetchOneBotForwardContent(forwardSegment.data.id).catch(() => null)
+    : null;
+  const images = dedupeQqImages([
+    ...extractOneBotImageInputs(data),
+    ...((forwardContext?.images) || [])
+  ]);
   return {
     messageId: String(data.message_id ?? messageId),
     senderId,
     senderName: data.sender?.card || data.sender?.nickname || senderId || "群友",
-    text: data.raw_message || textFromSegments,
+    text: forwardContext?.text
+      ? `[合并转发]\n${forwardContext.text}`
+      : (data.raw_message || textFromSegments),
     images,
     isSelf: selfId != null && senderId === String(selfId),
     raw: data
   };
+}
+
+async function fetchOneBotForwardContent(forwardId) {
+  const response = await fetch(`${oneBotApiBase}/get_forward_msg`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id: String(forwardId) })
+  });
+  const body = await response.json().catch(() => ({}));
+  const messages = Array.isArray(body.data?.messages)
+    ? body.data.messages
+    : Array.isArray(body.data)
+      ? body.data
+      : [];
+  if (!response.ok || body.status !== "ok" || messages.length === 0) {
+    throw new Error(`Unable to fetch forward QQ message ${forwardId}`);
+  }
+
+  const lines = [];
+  const images = [];
+  for (const node of messages) {
+    const senderName = node?.sender?.card || node?.sender?.nickname || node?.nickname || "群友";
+    const segments = Array.isArray(node?.content)
+      ? node.content
+      : Array.isArray(node?.message)
+        ? node.message
+        : Array.isArray(node?.data?.content)
+          ? node.data.content
+          : [];
+    const text = segments
+      .filter((segment) => segment?.type === "text")
+      .map((segment) => segment.data?.text ?? "")
+      .join("")
+      .trim();
+    const nodeImages = extractOneBotImageInputs({ message: segments });
+    if (text) lines.push(`${senderName}：${text}`);
+    else if (nodeImages.length > 0) lines.push(`${senderName}：[图片]`);
+    images.push(...nodeImages);
+  }
+
+  return {
+    text: lines.join("\n").trim(),
+    images: dedupeQqImages(images)
+  };
+}
+
+function dedupeQqImages(images) {
+  const seen = new Set();
+  const output = [];
+  for (const image of images || []) {
+    const key = `${image.file || ""}|${image.url || ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(image);
+  }
+  return output;
 }
 
 async function attachReplyContext(event) {
