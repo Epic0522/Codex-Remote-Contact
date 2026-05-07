@@ -4972,8 +4972,11 @@ async function ensureCodexReplyWorkspace() {
   );
 }
 
-async function sendOneBotGroupReply(event, reply) {
+async function sendOneBotGroupReply(event, reply, options = {}) {
   if (!event.groupId) return { ok: false, reason: "Missing group id" };
+  if (options.singleBubble) {
+    return sendOneBotGroupMessage(event, reply, { quoteSource: isExplicitQqAtEvent(event) });
+  }
   return sendQqGroupBubbles({
     event,
     reply,
@@ -5397,7 +5400,9 @@ async function handleApi(req, res) {
       }
     } else if (record.reply) {
       try {
-        record.send = await sendOneBotGroupReply(event, record.reply);
+        record.send = await sendOneBotGroupReply(event, record.reply, {
+          singleBubble: Boolean(commandAction)
+        });
       } catch (error) {
         record.send = { ok: false, error: error.message };
       }
