@@ -21,6 +21,7 @@ const codexStateDbPath = join(codexHomeDir, "state_5.sqlite");
 const codexDesktopCacheDir = join(process.env.HOME || "", "Library", "Application Support", "Codex", "Cache", "Cache_Data");
 const settingsPath = join(dataDir, "settings.json");
 const qqMemoryPath = join(dataDir, "qq-memory.json");
+const qqPersonasPath = join(dataDir, "qq-personas.json");
 const imessageMemoryPath = join(dataDir, "imessage-memory.json");
 const remoteExecutionMemoryPath = join(dataDir, "remote-execution-memory.json");
 const unifiedMemoryPath = join(dataDir, "unified-memory.json");
@@ -160,7 +161,8 @@ const imessageMemoryLimit = Number(process.env.CODEX_REMOTE_CONTACT_IMESSAGE_MEM
 const remoteExecutionMemoryLimit = Number(process.env.CODEX_REMOTE_CONTACT_REMOTE_EXECUTION_MEMORY_LIMIT || 160);
 const remoteExecutionIdleTtlMs = Number(process.env.CODEX_REMOTE_CONTACT_REMOTE_EXECUTION_IDLE_TTL_MS || 15 * 60 * 1000);
 const qqWebLookupEnabled = process.env.CODEX_REMOTE_CONTACT_QQ_WEB_LOOKUP !== "0";
-const qqWebLookupTimeoutMs = Number(process.env.CODEX_REMOTE_CONTACT_QQ_WEB_TIMEOUT_MS || 7000);
+const qqWebLookupTimeoutMs = Number(process.env.CODEX_REMOTE_CONTACT_QQ_WEB_TIMEOUT_MS || 12000);
+const qqWebSearchProvider = String(process.env.CODEX_REMOTE_CONTACT_QQ_WEB_PROVIDER || "auto").trim().toLowerCase();
 const proxyShortcutName = process.env.CODEX_REMOTE_CONTACT_PROXY_TOGGLE_SHORTCUT || "切换VPN";
 const proxyConfirmTtlMs = Number(process.env.CODEX_REMOTE_CONTACT_PROXY_CONFIRM_TTL_MS || 3 * 60 * 1000);
 const imessageAttachmentSendingEnabled = process.env.CODEX_REMOTE_CONTACT_IMESSAGE_ATTACHMENTS === "1";
@@ -213,12 +215,16 @@ const state = {
       groupRecentLimit: qqGroupMemoryLimit,
       entries: {},
       recentMessages: {}
+    },
+    personas: {
+      groups: {}
     }
   },
   imessage: {
     trustedHandles: [],
     replyHandle: "",
     lastRowId: 0,
+    cursorReady: false,
     watchStartedAtAppleDate: 0,
     status: "idle",
     lastError: null,
@@ -270,6 +276,7 @@ const state = {
     },
     webLookup: {
       enabled: qqWebLookupEnabled,
+      effectiveProvider: null,
       lastQuery: null,
       lastRunAt: null,
       lastDurationMs: null,
@@ -336,6 +343,20 @@ async function loadQqMemory() {
   } catch (error) {
     if (error.code !== "ENOENT") {
       console.warn(`Unable to load QQ memory: ${error.message}`);
+    }
+  }
+}
+
+async function loadQqPersonas() {
+  await mkdir(dataDir, { recursive: true });
+  try {
+    const body = JSON.parse(await readFile(qqPersonasPath, "utf8"));
+    if (body && typeof body === "object" && body.groups && typeof body.groups === "object") {
+      state.qq.personas.groups = body.groups;
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.warn(`Unable to load QQ personas: ${error.message}`);
     }
   }
 }
@@ -521,6 +542,18 @@ async function saveQqMemory() {
   );
 }
 
+async function saveQqPersonas() {
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(
+    qqPersonasPath,
+    JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      groups: state.qq.personas.groups
+    }, null, 2)
+  );
+}
+
 async function loadIMessageMemory() {
   await mkdir(dataDir, { recursive: true });
   try {
@@ -582,6 +615,9 @@ function buildPublicState() {
   const recentMessageCounts = Object.fromEntries(
     Object.entries(state.qq.memory.recentMessages).map(([groupId, entries]) => [groupId, entries.length])
   );
+  const personaCounts = Object.fromEntries(
+    Object.entries(state.qq.personas.groups).map(([groupId, group]) => [groupId, Object.keys(group?.members || {}).length])
+  );
   return {
     ...state,
     qq: {
@@ -592,6 +628,9 @@ function buildPublicState() {
         groupRecentLimit: state.qq.memory.groupRecentLimit,
         groupCounts: memoryCounts,
         recentMessageCounts
+      },
+      personas: {
+        groupMemberCounts: personaCounts
       }
     },
     imessage: {
@@ -644,6 +683,19 @@ async function buildMemorySnapshot() {
         title: `QQ群上文 ${groupId}`,
         count: Array.isArray(entries) ? entries.length : 0,
         entries: normalizeMemoryEntries(entries, 30)
+      })),
+      personas: Object.entries(state.qq.personas.groups).map(([groupId, group]) => ({
+        id: groupId,
+        title: `QQ群画像 ${groupId}`,
+        count: Object.keys(group?.members || {}).length,
+        entries: Object.values(group?.members || {})
+          .sort((left, right) => Number(right?.messageCount || 0) - Number(left?.messageCount || 0))
+          .slice(0, 40)
+          .map((member) => ({
+            role: formatPersonaDisplayName(member),
+            text: formatPersonaSummary(member),
+            at: member.lastSeenAt || member.updatedAt || null
+          }))
       }))
     },
     imessage: Object.entries(state.imessage.memory.entries).map(([handle, entries]) => ({
@@ -689,7 +741,9 @@ async function buildMaintenanceStatus() {
       recentEvents: state.qq.events.length,
       memoryGroups: Object.keys(state.qq.memory.entries).length,
       recentMessageGroups: Object.keys(state.qq.memory.recentMessages).length,
-      webLookupEnabled: state.qq.webLookup.enabled
+      personaGroups: Object.keys(state.qq.personas.groups).length,
+      webLookupEnabled: state.qq.webLookup.enabled,
+      webLookupProvider: state.maintenance.webLookup.effectiveProvider || qqWebSearchProvider
     },
     imessage: {
       status: state.imessage.status,
@@ -1251,6 +1305,7 @@ function isExplicitQqAtEvent(event) {
 function stripMentionText(text) {
   let value = String(text || "")
     .replace(/\[CQ:image,[^\]]+\]/g, "")
+    .replace(/\[CQ:(?:record|voice|audio),[^\]]+\]/g, "")
     .replace(/\[CQ:face,[^\]]+\]/g, "")
     .replace(/\[CQ:reply,[^\]]+\]/g, "")
     .replace(/\[CQ:at,[^\]]+\]/g, "");
@@ -1272,6 +1327,7 @@ function escapeRegExp(value) {
 function normalizeQqDisplayText(text) {
   return String(text || "")
     .replace(/\[CQ:image,[^\]]+\]/g, "[图片]")
+    .replace(/\[CQ:(?:record|voice|audio),[^\]]+\]/g, "[语音]")
     .replace(/\[CQ:face,[^\]]+\]/g, "[表情]")
     .replace(/\[CQ:reply,[^\]]+\]/g, "")
     .replace(/\[CQ:at,qq=\d+(?:,name=([^\]]+))?[^\]]*\]/g, (_, name) => name ? `@${name}` : "@群友")
@@ -1282,11 +1338,12 @@ function normalizeQqDisplayText(text) {
 function shouldRespondToQq(event) {
   if (!state.channels.qq) return { ok: false, reason: "QQ channel is off" };
   if (isBannedQqSender(event)) return { ok: false, reason: "Sender is banned" };
+  if (hasUnhandledQqAudio(event)) return { ok: false, reason: "Voice message ignored until transcription is available" };
   if (event.type === "private_message") return { ok: true };
   if (event.groupId && !state.qq.allowedGroups.includes(event.groupId)) {
     return { ok: false, reason: "Group is not allowed" };
   }
-  if (state.qq.enhancer.enabled && hasPendingQqImageRequest(event)) {
+  if (hasPendingQqImageRequest(event)) {
     return { ok: true, reason: "Pending image request matched", proactive: true, inspectImages: true };
   }
   if (state.qq.enhancer.enabled) {
@@ -1300,6 +1357,12 @@ function shouldRespondToQq(event) {
     return { ok: false, reason: "Mention-only mode ignored this message" };
   }
   return { ok: true };
+}
+
+function hasUnhandledQqAudio(event) {
+  return Boolean(event.hasAudioSegment)
+    || /\[CQ:(?:record|voice|audio),/i.test(String(event.text || ""))
+    || /\[CQ:(?:record|voice|audio),/i.test(String(event.replyContext?.text || ""));
 }
 
 function markQqProactiveCooldown(decision, event) {
@@ -1624,7 +1687,8 @@ async function buildModelReply(event) {
   const id = crypto.randomUUID();
   const outputPath = join(codexTmpDir, `${id}.txt`);
   const quotedContext = formatQuotedContext(event);
-  const memoryContext = formatMemoryContext(event);
+  let memoryContext = formatMemoryContext(event, { expandLevel: 0 });
+  const personaContext = formatQqPersonaContext(event);
   const repetitionGuard = state.qq.enhancer.enabled ? buildQqRepetitionGuard(event) : "";
   const webContext = await buildWebLookupContext(event);
   const stickerCatalog = state.qq.enhancer.enabled ? await buildQqStickerCatalog(qqStickerDir) : [];
@@ -1637,17 +1701,21 @@ async function buildModelReply(event) {
     })
     : [];
   event.imagePaths = imagePaths;
-  const prompt = [
+  const buildReplyPrompt = async (memoryBlock, expandLevel = 0, forceLocalReply = false) => [
     await buildAssistantInstructions(event),
     "",
-    memoryContext,
-    memoryContext ? "" : null,
+    personaContext,
+    personaContext ? "" : null,
+    memoryBlock,
+    memoryBlock ? "" : null,
     repetitionGuard,
     repetitionGuard ? "" : null,
     quotedContext,
     quotedContext ? "" : null,
     webContext,
     webContext ? "" : null,
+    !forceLocalReply && expandLevel === 0 ? "如果这条消息明显是在追问前文、接上一句、问刚刚发生了什么，而你拿到的最近上下文仍然不够判断，请不要硬猜，直接只输出 [[qq_context_more]] 这个标记，让 Hub 继续向前翻记录后再回答。" : null,
+    expandLevel === 0 ? "" : null,
     state.qq.enhancer.enabled && event.proactiveDecision?.ownerContext ? `触发原因：${ownerLabel}刚刚在群里说话，Hub 已扫描上文并发现有你感兴趣的内容。请像看到上文后主动探头一样回应，不要假装${ownerLabel}直接问了你。` : null,
     state.qq.enhancer.enabled && event.proactiveDecision?.ownerContext ? "" : null,
     event.pendingImageRequestText ? `触发原因：${ownerLabel}刚刚说“${event.pendingImageRequestText}”，随后这张 QQ 图片到达。请直接看这张图并回应。` : null,
@@ -1664,6 +1732,8 @@ async function buildModelReply(event) {
     event.type === "private_message" ? "收到的 QQ 私聊：" : "收到的群消息：",
     text || "对方只 @ 了你，没有附加具体内容。",
     "",
+    forceLocalReply ? "不要再请求更多上下文，也不要输出任何内部标记。请基于当前消息、引用、图片和已经给到的上下文，给出自然回复。" : null,
+    forceLocalReply ? "" : null,
     event.type === "private_message"
       ? "请直接给出要发送到 QQ 私聊里的最终回复。不要追加服务式追问或“我还能继续帮你”的结尾。"
       : "请直接给出要发送到 QQ 群里的最终回复。不要追加服务式追问或“我还能继续帮你”的结尾。"
@@ -1691,6 +1761,7 @@ async function buildModelReply(event) {
     "-"
   ];
 
+  let prompt = await buildReplyPrompt(memoryContext, 0);
   await runCodexCli(args, prompt, {
     cwd: codexWorkspaceDir,
     timeout: 120000,
@@ -1700,7 +1771,34 @@ async function buildModelReply(event) {
     }
   });
 
-  const baseReply = cleanCodexReply(await readFile(outputPath, "utf8"));
+  let baseReply = cleanCodexReply(await readFile(outputPath, "utf8"));
+  if (shouldRequestExpandedQqContext(baseReply)) {
+    memoryContext = formatMemoryContext(event, { expandLevel: 1 });
+    if (memoryContext) {
+      prompt = await buildReplyPrompt(memoryContext, 1);
+      await runCodexCli(args, prompt, {
+        cwd: codexWorkspaceDir,
+        timeout: 120000,
+        env: {
+          ...process.env,
+          CODEX_REMOTE_CONTACT_QQ_MODE: "1"
+        }
+      });
+      baseReply = cleanCodexReply(await readFile(outputPath, "utf8"));
+    }
+  }
+  if (shouldRequestExpandedQqContext(baseReply)) {
+    prompt = await buildReplyPrompt(memoryContext, 1, true);
+    await runCodexCli(args, prompt, {
+      cwd: codexWorkspaceDir,
+      timeout: 120000,
+      env: {
+        ...process.env,
+        CODEX_REMOTE_CONTACT_QQ_MODE: "1"
+      }
+    });
+    baseReply = cleanCodexReply(await readFile(outputPath, "utf8"));
+  }
   const reply = state.qq.enhancer.enabled
     ? encourageQqStickerReply(
       deRepeatQqReply(deTemplateQqReply(baseReply, event), event),
@@ -1710,6 +1808,10 @@ async function buildModelReply(event) {
     : baseReply;
   if (!reply) return buildAssistantReply(event);
   return reply.slice(0, 900);
+}
+
+function shouldRequestExpandedQqContext(reply) {
+  return String(reply || "").trim() === "[[qq_context_more]]";
 }
 
 function deTemplateQqReply(reply, event) {
@@ -1965,9 +2067,10 @@ function stableModuloLocal(seed, modulo) {
 
 async function buildWebLookupContext(event) {
   const text = stripMentionText(event.text);
-  if (!shouldUseWebLookup(text)) return "";
+  if (!shouldUseWebLookup(event, text)) return "";
+  const query = buildWebLookupQuery(text);
   try {
-    const results = await searchWeb(text);
+    const results = await searchWeb(query);
     if (results.length === 0) return "";
     return [
       "联网查询摘要：",
@@ -1986,7 +2089,7 @@ async function buildWebLookupContext(event) {
   }
 }
 
-function shouldUseWebLookup(text) {
+function shouldUseWebLookup(event, text) {
   const normalized = String(text || "").trim();
   if (!state.qq.webLookup.enabled || !normalized) return false;
   if (isFilesystemProbe(normalized)) return false;
@@ -2000,6 +2103,10 @@ function shouldUseWebLookup(text) {
     return true;
   }
   return false;
+}
+
+function buildWebLookupQuery(text) {
+  return String(text || "").trim();
 }
 
 function noteQqImageRequest(event) {
@@ -2033,6 +2140,7 @@ function hasPendingQqImageRequest(event) {
 function shouldInspectQqImages(event, text) {
   if (!hasAnyQqImageReference(event)) return false;
   if (event.proactiveDecision?.inspectImages || event.pendingImageRequestText) return true;
+  if (isExplicitQqAtEvent(event)) return true;
   if (Array.isArray(event.replyContext?.images) && event.replyContext.images.length > 0) return true;
   const normalized = String(text || "").trim();
   if (!normalized) return false;
@@ -2067,12 +2175,22 @@ async function searchWeb(query) {
   state.maintenance.webLookup.lastQuery = query;
   state.maintenance.webLookup.lastRunAt = new Date().toISOString();
   try {
-    const wikipediaResults = await searchWikipedia(query, controller.signal).catch(() => []);
-    const duckDuckGoResults = await searchDuckDuckGo(query, controller.signal).catch((error) => {
-      if (wikipediaResults.length > 0) return [];
-      throw error;
-    });
-    const results = mergeSearchResults([...wikipediaResults, ...duckDuckGoResults]).slice(0, 3);
+    const queryVariants = buildWebQueryVariants(query);
+    const wikipediaResults = [];
+    const webResults = [];
+    const preferredProvider = chooseWebSearchProvider();
+    state.maintenance.webLookup.effectiveProvider = preferredProvider;
+
+    if (shouldUseWikipediaForQuery(query)) {
+      for (const variant of queryVariants.slice(0, 2)) {
+        const hits = await searchWikipedia(variant, controller.signal).catch(() => []);
+        wikipediaResults.push(...hits);
+        if (wikipediaResults.length >= 2) break;
+      }
+    }
+
+    await collectSearchProviderResults(preferredProvider, queryVariants, controller.signal, webResults);
+    const results = mergeSearchResults([...wikipediaResults, ...webResults]).slice(0, 5);
     const enriched = await enrichWebResults(results);
     state.maintenance.webLookup.lastOk = true;
     state.maintenance.webLookup.lastError = null;
@@ -2087,6 +2205,62 @@ async function searchWeb(query) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function chooseWebSearchProvider() {
+  if (qqWebSearchProvider === "duckduckgo" || qqWebSearchProvider === "ddg") return "duckduckgo";
+  return "duckduckgo";
+}
+
+async function collectSearchProviderResults(provider, queryVariants, signal, output) {
+  state.maintenance.webLookup.effectiveProvider = provider;
+  for (const variant of queryVariants.slice(0, 4)) {
+    const hits = await searchDuckDuckGo(variant, signal);
+    output.push(...hits);
+    if (output.length >= 5) return;
+  }
+}
+
+function buildWebQueryVariants(query) {
+  const raw = String(query || "").trim();
+  if (!raw) return [];
+  const stripped = stripSearchLeadWords(raw);
+  const base = stripQuestionTail(stripped);
+  const variants = [
+    raw,
+    stripped,
+    base,
+    isTimeSensitiveWebQuery(raw) ? `${base} 最新` : "",
+    /(攻略|配装|打法|角色|装备|技能|流派|版本|补丁)/i.test(raw) ? `${base} 攻略` : "",
+    /(是什么|什么意思|什么梗|定义|出处|来源)/i.test(raw) ? `${base} 解释` : "",
+    /(谁是|是谁)/i.test(raw) ? `${base} wiki` : ""
+  ];
+  return [...new Set(variants.map((item) => item.trim()).filter(Boolean))].slice(0, 5);
+}
+
+function shouldUseWikipediaForQuery(query) {
+  return isDefinitionStyleQuery(query);
+}
+
+function isDefinitionStyleQuery(query) {
+  return /(是什么意思|什么意思|啥意思|什么梗|啥梗|定义|百科|出处|来源|是什么)/i.test(String(query || ""));
+}
+
+function stripSearchLeadWords(query) {
+  return String(query || "")
+    .replace(/^(查一下|搜一下|帮我查一下|帮我搜一下|网上查一下|网上搜一下|给我查一下|给我搜一下|你查一下|你搜一下)\s*/i, "")
+    .trim();
+}
+
+function stripQuestionTail(query) {
+  return String(query || "")
+    .replace(/[？?。！!，,：:]+$/g, "")
+    .replace(/(是什么意思|什么意思|啥意思|什么梗|啥梗|是什么梗|什么定义|的定义是什么|定义是什么|是什么东西|是什么|是谁|谁是|出处是什么|来源是什么|最近怎么样|最新消息)$/i, "")
+    .trim() || String(query || "").trim();
+}
+
+function isTimeSensitiveWebQuery(text) {
+  return /(最近|最新|现在|今天|本周|本月|版本|补丁|更新|新闻|热搜|刚出|新出的|什么时候上线|什么时候更新)/i.test(String(text || ""));
 }
 
 async function searchWikipedia(query, signal) {
@@ -2248,17 +2422,20 @@ function normalizeDuckDuckGoUrl(url) {
   }
 }
 
-function formatMemoryContext(event) {
+function formatMemoryContext(event, { expandLevel = 0 } = {}) {
   if (!state.qq.memory.enabled || !event.groupId) return "";
   const participationEntries = state.qq.memory.entries[event.groupId] || [];
-  const recentParticipation = participationEntries.slice(-state.qq.memory.perGroupLimit);
-  const groupMessages = shouldUseGroupRecentContext(event) ? selectRelevantGroupMessages(event) : [];
+  const recentParticipation = participationEntries.slice(-Math.min(expandLevel > 0 ? 5 : 3, state.qq.memory.perGroupLimit));
+  const groupMessages = shouldUseGroupRecentContext(event) ? selectRelevantGroupMessages(event, { expandLevel }) : [];
   if (recentParticipation.length === 0 && groupMessages.length === 0) return "";
   const parts = [
     "轻量群聊记忆：",
     `以下包含此前 ${assistantName} 实际参与过的片段；如果本次问题明显需要看前文，才会附带白名单群最近发言的滚动缓冲。只在相关时参考，不要主动声明自己有记忆。`,
     "当用户问“某人在干什么/群里在聊什么/刚才什么情况/评价刚刚发生的事”时，如果这里有最近发言，必须直接基于最近发言回答，不要让用户再提供上一句。"
   ];
+  if (expandLevel > 0) {
+    parts.push("Hub 已继续向前翻了一页更早的记录；这些仍然只是补充线索，不代表可以脱离当前语境自由发挥。");
+  }
   if (groupMessages.length > 0) {
     parts.push(
       "",
@@ -2305,6 +2482,7 @@ async function rememberQqGroupMessage(event) {
   if (!state.channels.qq) return;
   if (!state.qq.allowedGroups.includes(event.groupId)) return;
   if (isBannedQqSender(event)) return;
+  if (hasUnhandledQqAudio(event)) return;
   const text = compactMemoryText(normalizeQqDisplayText(stripMentionText(event.text) || event.text || ""));
   if (!text && !event.hasAtSegment && !event.hasReplySegment) return;
   const entry = {
@@ -2326,16 +2504,18 @@ async function rememberQqGroupMessage(event) {
   };
   const current = state.qq.memory.recentMessages[event.groupId] || [];
   state.qq.memory.recentMessages[event.groupId] = [...current, entry].slice(-state.qq.memory.groupRecentLimit);
+  const personaChanged = updateQqPersonaFromEvent(event);
   await saveQqMemory();
+  if (personaChanged) await saveQqPersonas();
 }
 
-function selectRelevantGroupMessages(event) {
+function selectRelevantGroupMessages(event, { expandLevel = 0 } = {}) {
   const entries = state.qq.memory.recentMessages[event.groupId] || [];
   if (entries.length === 0) return [];
   const currentMessageId = event.raw?.message_id == null ? undefined : String(event.raw.message_id);
   const mentionedIds = extractMentionedUserIds(event);
   const targetNames = extractPossibleTargetNames(stripMentionText(event.text));
-  const previousContextWindow = needsBroaderContextWindow(event) ? 6 : 3;
+  const previousContextWindow = needsBroaderContextWindow(event) ? (expandLevel > 0 ? 12 : 6) : (expandLevel > 0 ? 6 : 3);
   const scored = entries.map((entry, index) => {
     let score = index / 1000;
     if (currentMessageId && entry.messageId === currentMessageId) score += 100;
@@ -2354,12 +2534,12 @@ function selectRelevantGroupMessages(event) {
     .flatMap((item) => expandBeforeIndex(scored, item.index, previousContextWindow))
     .filter((item, index, all) => all.findIndex((other) => other.index === item.index) === index)
     .sort((a, b) => a.index - b.index)
-    .slice(-14)
+    .slice(-(expandLevel > 0 ? 24 : 14))
     .map((item) => ({
       ...item.entry,
       isTrigger: currentMessageId && item.entry.messageId === currentMessageId
     }));
-  return selected.length ? selected : entries.slice(-10);
+  return selected.length ? selected : entries.slice(-(expandLevel > 0 ? 18 : 10));
 }
 
 function expandBeforeIndex(scored, index, radius) {
@@ -2443,6 +2623,164 @@ function compactMemoryText(text) {
     .slice(0, 220);
 }
 
+function getQqPersonaGroup(groupId) {
+  if (!groupId) return null;
+  const id = String(groupId);
+  if (!state.qq.personas.groups[id]) {
+    state.qq.personas.groups[id] = {
+      updatedAt: null,
+      members: {}
+    };
+  }
+  return state.qq.personas.groups[id];
+}
+
+function getQqPersonaMember(groupId, senderId, senderName = "") {
+  if (!groupId || !senderId) return null;
+  const group = getQqPersonaGroup(groupId);
+  const id = String(senderId);
+  if (!group.members[id]) {
+    group.members[id] = {
+      userId: id,
+      aliases: [],
+      messageCount: 0,
+      questionCount: 0,
+      imageCount: 0,
+      topicScores: {},
+      styleScores: {},
+      recentTexts: [],
+      firstSeenAt: null,
+      lastSeenAt: null,
+      updatedAt: null,
+      isOwner: false
+    };
+  }
+  const member = group.members[id];
+  addPersonaAlias(member, senderName);
+  return member;
+}
+
+function addPersonaAlias(member, alias) {
+  const value = String(alias || "").trim();
+  const normalized = normalizePersonaAlias(value);
+  if (!normalized) return;
+  const exists = (member.aliases || []).some((item) => normalizePersonaAlias(item) === normalized);
+  if (!exists) member.aliases = [...(member.aliases || []), value].slice(-12);
+}
+
+function normalizePersonaAlias(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[\s_\-·.。,【】\[\]()（）'"“”‘’]+/g, "")
+    .trim();
+}
+
+function detectQqPersonaTopics(text) {
+  const value = String(text || "");
+  const rules = [
+    ["tech", /(电脑|显卡|驱动|系统|windows|macos|linux|脚本|代码|编译|构建|npm|node|python|git|模型|ai|代理|网络|服务器|bug|报错|终端)/i],
+    ["anime", /(二次元|番剧|动画|动漫|漫画|gal|手游|抽卡|同人|声优|vtb|偶像|live|手办|谷子)/i],
+    ["games", /(游戏|开黑|联机|副本|练度|手游|端游|主机|steam|fps|rpg|上分)/i],
+    ["daily", /(吃饭|睡觉|上课|下课|作业|考试|学校|公司|下班|上班|出门|回家|困|累)/i],
+    ["news", /(新闻|热搜|公告|通报|官方|媒体|记者|回应|辟谣)/i]
+  ];
+  return rules.filter(([, pattern]) => pattern.test(value)).map(([name]) => name);
+}
+
+function detectQqPersonaStyles(text) {
+  const value = String(text || "");
+  const rules = [
+    ["question", /[?？]|(怎么|如何|为什么|啥|什么|谁|在哪|能不能|可不可以)/],
+    ["chaos", /(发癫|发疯|抽风|逆天|抽象|离谱|🤣|😂|💀|🤡|😭|草|绷)/u],
+    ["helpful", /(帮我|求|请问|教程|解释|分析|总结|修|配|写|查一下|搜一下)/],
+    ["brief", /^.{1,8}$/],
+    ["longform", /^.{60,}$/]
+  ];
+  return rules.filter(([, pattern]) => pattern.test(value)).map(([name]) => name);
+}
+
+function bumpCounter(map, key, amount = 1) {
+  if (!key) return;
+  map[key] = Number(map[key] || 0) + amount;
+}
+
+function topPersonaKeys(scores, limit = 3) {
+  return Object.entries(scores || {})
+    .filter(([, score]) => Number(score) > 0)
+    .sort((left, right) => Number(right[1]) - Number(left[1]))
+    .slice(0, limit)
+    .map(([key]) => key);
+}
+
+function personaTopicLabel(key) {
+  return {
+    tech: "技术/折腾",
+    anime: "二次元",
+    games: "游戏",
+    daily: "日常",
+    news: "新闻/热搜"
+  }[key] || key;
+}
+
+function personaStyleLabel(key) {
+  return {
+    question: "经常提问",
+    chaos: "表达偏抽象",
+    helpful: "常带着求助或任务来",
+    brief: "发言偏短",
+    longform: "发言偏长"
+  }[key] || key;
+}
+
+function formatPersonaDisplayName(member) {
+  return (member.aliases || []).find(Boolean) || `QQ ${member.userId}`;
+}
+
+function formatPersonaSummary(member) {
+  const topics = topPersonaKeys(member.topicScores, 3).map(personaTopicLabel);
+  const styles = topPersonaKeys(member.styleScores, 3).map(personaStyleLabel);
+  const parts = [`QQ号 ${member.userId}`, `发言 ${member.messageCount || 0} 次`];
+  if (topics.length > 0) parts.push(`常聊：${topics.join("、")}`);
+  if (styles.length > 0) parts.push(`风格：${styles.join("、")}`);
+  return parts.join("；");
+}
+
+function updateQqPersonaFromEvent(event) {
+  if (!event.groupId || !event.senderId) return false;
+  const member = getQqPersonaMember(event.groupId, event.senderId, event.senderName);
+  if (!member) return false;
+  const now = new Date().toISOString();
+  const text = compactMemoryText(normalizeQqDisplayText(stripMentionText(event.text) || event.text || ""));
+  member.firstSeenAt ||= now;
+  member.lastSeenAt = now;
+  member.updatedAt = now;
+  member.messageCount = Number(member.messageCount || 0) + 1;
+  member.questionCount = Number(member.questionCount || 0) + (/[?？]/.test(text) ? 1 : 0);
+  member.imageCount = Number(member.imageCount || 0) + ((event.images || []).length > 0 ? 1 : 0);
+  member.isOwner = Boolean(member.isOwner || event.isOwner);
+  for (const topic of detectQqPersonaTopics(text)) bumpCounter(member.topicScores, topic);
+  for (const style of detectQqPersonaStyles(text)) bumpCounter(member.styleScores, style);
+  if (text) member.recentTexts = [...(member.recentTexts || []), text].slice(-8);
+  getQqPersonaGroup(event.groupId).updatedAt = now;
+  return true;
+}
+
+function formatQqPersonaContext(event) {
+  if (!event.groupId) return "";
+  const members = [];
+  if (event.senderId) members.push(getQqPersonaMember(event.groupId, event.senderId, event.senderName));
+  if (event.replyContext?.senderId) {
+    members.push(getQqPersonaMember(event.groupId, event.replyContext.senderId, event.replyContext.senderName));
+  }
+  const unique = members.filter((member, index, all) => member && all.findIndex((other) => other?.userId === member.userId) === index);
+  if (unique.length === 0) return "";
+  return [
+    "长期群友画像：",
+    "以下是根据本群长期发言累计出的弱参考，只能辅助理解语气和常聊主题，不要把不确定细节说成事实。",
+    ...unique.map((member) => `${formatPersonaDisplayName(member)}：${formatPersonaSummary(member)}`)
+  ].join("\n");
+}
+
 function sqliteJson(query) {
   return new Promise((resolve, reject) => {
     const child = spawn("/usr/bin/sqlite3", ["-json", `${process.env.HOME}/Library/Messages/chat.db`, query], {
@@ -2493,12 +2831,19 @@ function extractAttributedBodyText(hex) {
 async function initializeIMessageCursor() {
   const rows = await sqliteJson("select coalesce(max(ROWID), 0) as rowid from message;");
   state.imessage.lastRowId = Number(rows[0]?.rowid || 0);
+  state.imessage.cursorReady = true;
   state.imessage.watchStartedAtAppleDate = currentIMessageAppleDate() - (imessageStartupGraceMs * 1_000_000);
   seenIMessageGuids.clear();
   recentIMessageReplies.clear();
   recentIMessageRequests.clear();
   state.imessage.status = "watching";
   state.imessage.lastError = null;
+}
+
+function resetIMessageCursor() {
+  state.imessage.lastRowId = 0;
+  state.imessage.cursorReady = false;
+  state.imessage.watchStartedAtAppleDate = 0;
 }
 
 function currentIMessageAppleDate() {
@@ -2509,16 +2854,19 @@ function updateIMessagePoller() {
   if (!state.channels.imessage) {
     if (imessagePollTimer) clearInterval(imessagePollTimer);
     imessagePollTimer = null;
+    resetIMessageCursor();
     state.imessage.status = "idle";
     return;
   }
   if (imessagePollTimer) return;
   initializeIMessageCursor().catch((error) => {
+    if (shouldResetIMessageCursorOnError(error)) resetIMessageCursor();
     state.imessage.status = "error";
     state.imessage.lastError = explainIMessageError(error);
   });
   imessagePollTimer = setInterval(() => {
     pollIMessage().catch((error) => {
+      if (shouldResetIMessageCursorOnError(error)) resetIMessageCursor();
       state.imessage.status = "error";
       state.imessage.lastError = explainIMessageError(error);
     });
@@ -2533,10 +2881,19 @@ function explainIMessageError(error) {
   return message;
 }
 
+function shouldResetIMessageCursorOnError(error) {
+  const message = error?.message || String(error);
+  return message.includes("authorization denied") || message.includes("unable to open database");
+}
+
 async function pollIMessage() {
   if (imessagePolling || !state.channels.imessage) return;
   imessagePolling = true;
   try {
+    if (!state.imessage.cursorReady) {
+      await initializeIMessageCursor();
+      return;
+    }
     const rows = await sqliteJson([
       "select message.ROWID as rowid,",
       "coalesce(message.text, '') as text,",
@@ -2749,10 +3106,16 @@ async function handleIMessageCommand(event) {
   let reply = null;
   let send = null;
   let replySent = false;
+  let isSlashCommand = false;
   if (trusted) {
     try {
       expireRemoteExecutionIfIdle({ notify: false });
-      if (isIMessageDesktopScreenshotRequest(event.text)) {
+      const temporaryRoute = extractIMessageTemporaryCodexRoute(event.text);
+      const chatEvent = temporaryRoute.hasOverrides
+        ? { ...event, text: temporaryRoute.text, temporaryCodex: temporaryRoute.codex }
+        : event;
+      isSlashCommand = event.text.trim().startsWith("/") && !temporaryRoute.hasOverrides;
+      if (isIMessageDesktopScreenshotRequest(chatEvent.text)) {
         const screenshotPath = await captureDesktopScreenshot();
         if (imessageImageDelivery === "photos") {
           const photoImport = await importImageToPhotos(screenshotPath);
@@ -2775,21 +3138,36 @@ async function handleIMessageCommand(event) {
             result = { ok: true, summary: "Desktop screenshot captured", attachmentPath: screenshotPath };
           }
         }
-      } else if (event.text.trim().startsWith("/")) {
+      } else if (isSlashCommand) {
         result = await executeIMessageCommand(event.text, event);
         reply = result.reply || result.summary;
+      } else if (temporaryRoute.hasOverrides && !temporaryRoute.hasBody) {
+        reply = "临时模型指令后面要跟正文，例如：\n/5.5 /high\n请分析这个问题";
+        result = { ok: false, summary: "Temporary iMessage route has no body" };
       } else if (state.remoteExecution.enabled) {
         touchRemoteExecutionActivity();
-        reply = await buildRemoteExecutionReply(event);
-        result = { ok: true, summary: "Remote execution reply generated" };
+        reply = await buildRemoteExecutionReply(chatEvent);
+        result = {
+          ok: true,
+          summary: temporaryRoute.hasOverrides
+            ? `Remote execution reply generated with temporary route ${formatTemporaryCodexRouteSummary(temporaryRoute.codex)}`
+            : "Remote execution reply generated"
+        };
       } else {
-        const unifiedMemoryContext = await prepareUnifiedMemoryForIMessage(event);
+        const unifiedMemoryContext = await prepareUnifiedMemoryForIMessage(chatEvent);
+        chatEvent.unifiedMemoryDecision = unifiedMemoryContext.decision;
+        chatEvent.unifiedMemoryRecallRoute = unifiedMemoryContext.recallRoute;
         event.unifiedMemoryDecision = unifiedMemoryContext.decision;
         event.unifiedMemoryRecallRoute = unifiedMemoryContext.recallRoute;
-        reply = await buildIMessagePrivateReply(event, unifiedMemoryContext.promptContext, {
+        reply = await buildIMessagePrivateReply(chatEvent, unifiedMemoryContext.promptContext, {
           suppressRollingIMessageContext: unifiedMemoryContext.recallRoute?.source?.startsWith?.("desktop")
         });
-        result = { ok: true, summary: "Private reply generated" };
+        result = {
+          ok: true,
+          summary: temporaryRoute.hasOverrides
+            ? `Private reply generated with temporary route ${formatTemporaryCodexRouteSummary(temporaryRoute.codex)}`
+            : "Private reply generated"
+        };
       }
       const attachmentPaths = state.remoteExecution.enabled ? extractIMessageAttachmentMarkers(reply) : [];
       reply = stripIMessageAttachmentMarkers(reply);
@@ -2819,9 +3197,9 @@ async function handleIMessageCommand(event) {
       }
       if (result?.sleepSystem) scheduleSystemSleep();
       if (state.remoteExecution.enabled && reply && send?.ok) touchRemoteExecutionActivity();
-      if (!event.text.trim().startsWith("/") && !state.remoteExecution.enabled && reply && send?.ok) {
-        await rememberIMessageTurn(event, reply);
-        await applyUnifiedMemoryDecision(event, reply);
+      if (!isSlashCommand && !state.remoteExecution.enabled && reply && send?.ok) {
+        await rememberIMessageTurn(chatEvent, reply);
+        await applyUnifiedMemoryDecision(chatEvent, reply);
       }
     } catch (error) {
       result = { ok: false, summary: error.message };
@@ -3660,6 +4038,93 @@ function normalizeReasoningEffort(value) {
   return normalized;
 }
 
+function extractIMessageTemporaryCodexRoute(text) {
+  const original = String(text || "");
+  const lines = original.split(/\r?\n/);
+  const codex = {};
+  let start = 0;
+  let end = lines.length - 1;
+  let hasOverrides = false;
+
+  while (start <= end && !lines[start].trim()) start += 1;
+  while (end >= start && !lines[end].trim()) end -= 1;
+
+  const leading = parseIMessageTemporaryDirectiveLine(lines[start]);
+  if (leading.ok) {
+    Object.assign(codex, leading.codex);
+    hasOverrides = true;
+    start += 1;
+    while (start <= end && !lines[start].trim()) start += 1;
+  }
+
+  const trailing = parseIMessageTemporaryDirectiveLine(lines[end]);
+  if (trailing.ok) {
+    Object.assign(codex, trailing.codex);
+    hasOverrides = true;
+    end -= 1;
+    while (end >= start && !lines[end].trim()) end -= 1;
+  }
+
+  const stripped = start <= end ? lines.slice(start, end + 1).join("\n").trim() : "";
+  return {
+    hasOverrides,
+    hasBody: Boolean(stripped),
+    text: hasOverrides ? stripped : original,
+    codex
+  };
+}
+
+function parseIMessageTemporaryDirectiveLine(line) {
+  const tokens = String(line || "").trim().split(/\s+/).filter(Boolean);
+  if (!tokens.length || tokens.some((token) => !token.startsWith("/"))) return { ok: false, codex: {} };
+  const codex = {};
+  for (const token of tokens) {
+    const model = resolveIMessageTemporaryModelToken(token);
+    if (model) {
+      codex.model = model;
+      continue;
+    }
+    const effort = resolveIMessageTemporaryEffortToken(token);
+    if (effort) {
+      codex.reasoningEffort = effort;
+      continue;
+    }
+    return { ok: false, codex: {} };
+  }
+  return Object.keys(codex).length ? { ok: true, codex } : { ok: false, codex: {} };
+}
+
+function resolveIMessageTemporaryModelToken(token) {
+  const raw = String(token || "").trim().replace(/^\/+/, "");
+  const normalized = raw.toLowerCase();
+  const aliases = {
+    "5": "gpt-5",
+    "5.5": "gpt-5.5",
+    "5.4": "gpt-5.4",
+    "5.4-mini": "gpt-5.4-mini",
+    "mini": "gpt-5.4-mini",
+    "5.3": "gpt-5.3-codex",
+    "5.3-codex": "gpt-5.3-codex",
+    "codex": "gpt-5.3-codex"
+  };
+  if (aliases[normalized]) return aliases[normalized];
+  if (/^gpt-[A-Za-z0-9._:-]+$/.test(raw)) return raw;
+  return "";
+}
+
+function resolveIMessageTemporaryEffortToken(token) {
+  const raw = String(token || "").trim().replace(/^\/+/, "");
+  const effort = normalizeReasoningEffort(raw);
+  return isValidReasoningEffort(effort) ? effort : "";
+}
+
+function formatTemporaryCodexRouteSummary(codex = {}) {
+  return [
+    codex.model ? `model=${codex.model}` : null,
+    codex.reasoningEffort ? `effort=${codex.reasoningEffort}` : null
+  ].filter(Boolean).join(", ") || "default";
+}
+
 async function executePendingRemoteExecutionAction() {
   const pending = state.remoteExecution.pendingAction;
   if (!pending) {
@@ -3891,6 +4356,8 @@ async function buildRemoteExecutionReply(event) {
   const memoryContext = formatRemoteExecutionMemoryContext();
   const unifiedMemoryContext = await unifiedMemory.formatForPrompt({ query: event.text, limit: 8 });
   const skillContext = await loadRemoteExecutionSkillContext();
+  const effectiveModel = event.temporaryCodex?.model || state.remoteExecution.model;
+  const effectiveReasoningEffort = event.temporaryCodex?.reasoningEffort || state.remoteExecution.reasoningEffort;
   const prompt = [
     // Deployment customization: this high-permission prompt is neutral. Add
     // relationship/profile wording through assistantProfilePath or skill paths.
@@ -3902,8 +4369,8 @@ async function buildRemoteExecutionReply(event) {
     `如果${ownerLabel}说“给我看看”“截图给我看”“现在什么样”等跟进话，并且前文刚操作过 Finder、文件夹、App 或桌面状态，你应该主动打开相关窗口或切到相关 App，再用 screencapture 生成 PNG 截图。`,
     `如果需要把截图或图片给${ownerLabel}看，请把图片保存为本机绝对路径，并在最终回复单独包含一行：[[imessage_attachment:/absolute/path/to/image.png]]。Hub 会根据当前配置把图片导入 Photos/iCloud 照片或作为 iMessage 附件发送。不要把标记解释给${ownerLabel}看。`,
     `你可以自然称呼对方为${ownerLabel}，自称用“我”。部署者可在 profile 中覆盖具体语气和自定义风格。`,
-    `当前远程执行模式模型：${state.remoteExecution.model}`,
-    `当前智能等级：${state.remoteExecution.reasoningEffort}`,
+    `当前远程执行模式模型：${effectiveModel}`,
+    `当前智能等级：${effectiveReasoningEffort}`,
     "",
     skillContext,
     skillContext ? "" : null,
@@ -3930,9 +4397,9 @@ async function buildRemoteExecutionReply(event) {
       "-s",
       "danger-full-access",
       "-m",
-      state.remoteExecution.model,
+      effectiveModel,
       "-c",
-      `model_reasoning_effort="${state.remoteExecution.reasoningEffort}"`,
+      `model_reasoning_effort="${effectiveReasoningEffort}"`,
       "-C",
       projectDir,
       "-o",
@@ -4037,6 +4504,8 @@ async function buildIMessagePrivateReply(event, unifiedMemoryContext = "", optio
         unifiedPrompt: "",
         recallRoute: options.recallRoute
       });
+  const effectiveModel = event.temporaryCodex?.model || state.ai.imessageModel;
+  const effectiveReasoningEffort = event.temporaryCodex?.reasoningEffort || state.ai.imessageReasoningEffort;
   const prompt = [
     await buildIMessageInstructions(),
     "",
@@ -4063,9 +4532,9 @@ async function buildIMessagePrivateReply(event, unifiedMemoryContext = "", optio
     "-s",
     "read-only",
     "-m",
-    state.ai.imessageModel,
+    effectiveModel,
     "-c",
-    `model_reasoning_effort="${state.ai.imessageReasoningEffort}"`,
+    `model_reasoning_effort="${effectiveReasoningEffort}"`,
     "-C",
     codexWorkspaceDir,
     "-o",
@@ -5192,6 +5661,7 @@ async function attachReplyContext(event) {
 
 function normalizeOneBotEvent(payload) {
   const segments = Array.isArray(payload.message) ? payload.message : [];
+  const hasAudioSegment = segments.some((segment) => ["record", "voice", "audio"].includes(String(segment?.type || "").toLowerCase()));
   const textFromSegments = segments
     .filter((segment) => segment?.type === "text")
     .map((segment) => segment.data?.text ?? "")
@@ -5217,6 +5687,7 @@ function normalizeOneBotEvent(payload) {
     senderName: payload.sender?.card || payload.sender?.nickname || String(payload.user_id || "群友"),
     text: payload.raw_message || textFromSegments,
     images,
+    hasAudioSegment,
     hasAtSegment,
     hasSelfAtSegment,
     atTargets,
@@ -5332,11 +5803,14 @@ async function handleApi(req, res) {
     if (body.groupId) {
       delete state.qq.memory.entries[String(body.groupId)];
       delete state.qq.memory.recentMessages[String(body.groupId)];
+      delete state.qq.personas.groups[String(body.groupId)];
     } else {
       state.qq.memory.entries = {};
       state.qq.memory.recentMessages = {};
+      state.qq.personas.groups = {};
     }
     await saveQqMemory();
+    await saveQqPersonas();
     return sendJson(res, 200, buildPublicState());
   }
 
@@ -5359,11 +5833,14 @@ async function handleApi(req, res) {
       if (id) {
         delete state.qq.memory.entries[id];
         delete state.qq.memory.recentMessages[id];
+        delete state.qq.personas.groups[id];
       } else {
         state.qq.memory.entries = {};
         state.qq.memory.recentMessages = {};
+        state.qq.personas.groups = {};
       }
       await saveQqMemory();
+      await saveQqPersonas();
       return sendJson(res, 200, await buildMemorySnapshot());
     }
     return sendJson(res, 400, { error: "Unknown memory scope" });
@@ -5497,6 +5974,7 @@ async function serveStatic(req, res) {
 await loadSettings();
 await mkdir(qqStickerDir, { recursive: true });
 await loadQqMemory();
+await loadQqPersonas();
 await loadIMessageMemory();
 await loadRemoteExecutionMemory();
 updateIMessagePoller();

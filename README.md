@@ -31,8 +31,8 @@ The main program is intentionally usable by itself. Optional update packages suc
 | Module / 模块 | Description / 说明 |
 | :--- | :--- |
 | iMessage console / iMessage 控制台 | Receive trusted commands such as `/状态`, `/维护`, `/开启QQ`, `/关闭QQ`, `/节点检查`, `/切换节点`, and `/远程执行`.<br>接收可信联系人发来的 `/状态`、`/维护`、`/开启QQ`、`/关闭QQ`、`/节点检查`、`/切换节点`、`/远程执行` 等指令。 |
-| iMessage private replies / iMessage 私聊回复 | Generate replies through Codex CLI and keep an independent rolling context.<br>调用 Codex CLI 生成回复，并保存独立滚动上下文。 |
-| QQ/OneBot channel / QQ 通道 | Receive QQ group and private messages through LLBot or another OneBot-compatible bridge.<br>通过 LLBot 或其他 OneBot 兼容桥接器接收 QQ 群聊和私聊。 |
+| iMessage private replies / iMessage 私聊回复 | Generate replies through Codex CLI, keep an independent rolling context, recover the polling cursor after database permission failures, and support one-message model overrides.<br>调用 Codex CLI 生成回复，保存独立滚动上下文，在数据库权限故障后自动恢复轮询游标，并支持单条消息临时切换模型。 |
+| QQ/OneBot channel / QQ 通道 | Receive QQ group and private messages, ignore untranscribed voice messages, inspect explicitly mentioned images, expand recent context when needed, and keep lightweight member personas.<br>接收 QQ 群聊和私聊，忽略尚未转写的语音消息，识别明确 @ 附图，在需要时继续向前翻上下文，并保存轻量群友画像。 |
 | Remote execution / 远程执行模式 | Start a full Codex CLI local task channel from iMessage.<br>通过 iMessage 开启完整 Codex CLI 本机任务通道。 |
 | Proxy and system control / 代理与系统控制 | Control Shadowrocket node status/check/switching, keep-awake, display sleep, and built-in-display backlight helper scripts.<br>支持 Shadowrocket 节点状态、测速、切换确认，以及防休眠、显示器休眠、内置屏背光控制脚本。 |
 | Optional packages / 可选升级包 | Load `qq-enhancer` and `unified-memory` when present; fall back cleanly when absent.<br>存在时加载 `qq-enhancer` 与 `unified-memory`；不存在时自动降级。 |
@@ -226,6 +226,19 @@ Grant permissions to the process that actually runs the hub. For Terminal deploy
 Sign in to Messages on the Mac and make sure `replyHandle` can send iMessages to the configured `trustedHandles`.
 
 在 Mac 的“信息”App 登录账号，并确认 `replyHandle` 能向 `trustedHandles` 发送 iMessage。
+
+For a one-message model or reasoning override, add a directive line before or after the message body:
+
+普通 iMessage 私聊可以在正文前或正文后追加一次性模型或思考强度指令：
+
+```text
+/5.5 /high
+Analyze this problem
+```
+
+Common aliases include `/5.5`, `/5.4`, `/mini`, `/low`, `/medium`, `/high`, and `/xhigh`. These overrides affect only the current reply.
+
+常用别名包括 `/5.5`、`/5.4`、`/mini`、`/low`、`/medium`、`/high` 和 `/xhigh`，只影响当前这一条回复。
 
 ### 5. Prepare QQ / OneBot / 准备 QQ 与 OneBot
 
@@ -431,7 +444,8 @@ CODEX_REMOTE_CONTACT_IMESSAGE_MEMORY_LIMIT=120
 CODEX_REMOTE_CONTACT_QQ_MEMORY_LIMIT=10
 CODEX_REMOTE_CONTACT_QQ_GROUP_MEMORY_LIMIT=30
 CODEX_REMOTE_CONTACT_QQ_WEB_LOOKUP=1
-CODEX_REMOTE_CONTACT_QQ_WEB_TIMEOUT_MS=7000
+CODEX_REMOTE_CONTACT_QQ_WEB_TIMEOUT_MS=12000
+CODEX_REMOTE_CONTACT_QQ_WEB_PROVIDER=auto
 
 CODEX_REMOTE_CONTACT_REMOTE_EXECUTION_MODEL=gpt-5.4
 CODEX_REMOTE_CONTACT_REMOTE_EXECUTION_REASONING_EFFORT=medium
